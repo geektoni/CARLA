@@ -5,6 +5,7 @@ from .catalog import (
     CCHVAE,
     CEM,
     CRUD,
+    FARE,
     FOCUS,
     ActionableRecourse,
     CausalRecourse,
