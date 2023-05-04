@@ -14,7 +14,8 @@ DECISION_THRESHOLD = 0.5
 
 
 def wachter_recourse(
-    torch_model,
+    model,
+    model_backend,
     x: np.ndarray,
     cat_feature_indices: List[int],
     binary_cat_features: bool,
@@ -33,7 +34,7 @@ def wachter_recourse(
 
     Parameters
     ----------
-    torch_model:
+    model:
         black-box-model to discover
     x:
         Factual instance to explain.
@@ -78,9 +79,12 @@ def wachter_recourse(
     x_new = Variable(x.clone(), requires_grad=True)
     # x_new_enc is a copy of x_new with reconstructed encoding constraints of x_new
     # such that categorical data is either 0 or 1
-    x_new_enc = reconstruct_encoding_constraints(
-        x_new, cat_feature_indices, binary_cat_features
-    )
+    if cat_feature_indices:
+        x_new_enc = reconstruct_encoding_constraints(
+            x_new, cat_feature_indices, binary_cat_features
+        )
+    else:
+        x_new_enc = x_new.clone()
 
     optimizer = optim.Adam([x_new], lr, amsgrad=True)
 
@@ -106,7 +110,10 @@ def wachter_recourse(
         raise ValueError(f"loss_type {loss_type} not supported")
 
     # get the probablity of the target class
-    f_x_new = torch_model(x_new)[:, target_class]
+    if model_backend == "pytorch":
+        f_x_new = model(x_new)
+    else:
+        f_x_new = model.predict_proba(x_new.detach())[:, target_class]
 
     t0 = datetime.datetime.now()
     t_max = datetime.timedelta(minutes=t_max_min)
@@ -114,34 +121,52 @@ def wachter_recourse(
         it = 0
         while f_x_new <= 0.5 and it < n_iter:
             optimizer.zero_grad()
-            x_new_enc = reconstruct_encoding_constraints(
-                x_new, cat_feature_indices, binary_cat_features
-            )
+            if cat_feature_indices:
+                x_new_enc = reconstruct_encoding_constraints(
+                    x_new, cat_feature_indices, binary_cat_features
+                )
+            else:
+                x_new_enc = x_new.clone().clamp_(1)
             # use x_new_enc for prediction results to ensure constraints
             # get the probablity of the target class
-            f_x_new = torch_model(x_new_enc)[:, target_class]
+            if model_backend == "pytorch":
+                f_x_new = model(x_new_enc)
+            else:
+                f_x_new = model.predict_proba(x_new_enc.clone().detach())[
+                    :, target_class
+                ]
+                f_x_new = torch.FloatTensor(f_x_new)
 
             if loss_type == "MSE":
                 # single logit score for the target class for MSE loss
                 f_x_loss = torch.log(f_x_new / (1 - f_x_new))
             elif loss_type == "BCE":
                 # tuple output for BCE loss
-                f_x_loss = torch_model(x_new_enc).squeeze(axis=0)
+                if model_backend == "pytorch":
+                    f_x_loss = model(x_new_enc).squeeze(axis=0)
+                else:
+                    f_x_loss = model.predict_proba(x_new_enc.clone().detach()).squeeze(
+                        axis=0
+                    )
+                    f_x_loss = torch.FloatTensor(f_x_loss)
+
             else:
                 raise ValueError(f"loss_type {loss_type} not supported")
 
             cost = (
                 torch.dist(x_new_enc, x, norm)
                 if feature_costs is None
-                else torch.norm(feature_costs * (x_new_enc - x), norm)
+                else torch.norm(
+                    feature_costs * torch.abs(x_new_enc - x).clamp_(1), norm
+                )
             )
 
-            loss = loss_fn(f_x_loss, y_target) + lamb * cost
+            loss = loss_fn(f_x_loss, torch.ones(1)) + lamb * cost
             loss.backward()
             optimizer.step()
             # clamp potential CF
             if clamp:
-                x_new.clone().clamp_(0, 1)
+                x_new.clone().clamp_(0)
             it += 1
         lamb -= 0.05
 

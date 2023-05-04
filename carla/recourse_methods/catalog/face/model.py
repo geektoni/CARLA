@@ -1,6 +1,8 @@
 from typing import Dict, Optional
 
+import numpy as np
 import pandas as pd
+from tqdm import tqdm
 
 from carla.models.api import MLModel
 from carla.recourse_methods.api import RecourseMethod
@@ -43,11 +45,17 @@ class Face(RecourseMethod):
             of the AAAI/ACM Conference on AI, Ethics, and Society (AIES)
     """
 
-    _DEFAULT_HYPERPARAMS = {"mode": "knn", "fraction": 0.05}
+    _DEFAULT_HYPERPARAMS = {
+        "mode": "knn",
+        "fraction": 0.05,
+        "radius": 0.25,
+        "weight_function": "__optional__",
+        "epsilon_constraints": 0.5,
+    }
 
     def __init__(self, mlmodel: MLModel, hyperparams: Optional[Dict] = None) -> None:
 
-        supported_backends = ["tensorflow", "pytorch"]
+        supported_backends = ["tensorflow", "pytorch", "sklearn"]
         if mlmodel.backend not in supported_backends:
             raise ValueError(
                 f"{mlmodel.backend} is not in supported backends {supported_backends}"
@@ -60,10 +68,21 @@ class Face(RecourseMethod):
         )
         self.mode = checked_hyperparams["mode"]
         self.fraction = checked_hyperparams["fraction"]
+        self.radius = checked_hyperparams["radius"]
+        self.weight_function = checked_hyperparams["weight_function"]
+        self.epsilon_constraints = checked_hyperparams["epsilon_constraints"]
 
         self._immutables = encode_feature_names(
             self._mlmodel.data.immutables, self._mlmodel.feature_input_order
         )
+
+    @property
+    def radius(self) -> float:
+        return self._radius
+
+    @radius.setter
+    def radius(self, x: float) -> float:
+        self._radius = x
 
     @property
     def fraction(self) -> float:
@@ -101,29 +120,38 @@ class Face(RecourseMethod):
         else:
             raise ValueError("Mode has to be either knn or epsilon")
 
-    def get_counterfactuals(self, factuals: pd.DataFrame) -> pd.DataFrame:
+    def get_counterfactuals(
+        self, factuals: pd.DataFrame, W, G=None, n_neighbors=50
+    ) -> pd.DataFrame:
         # >drop< factuals from dataset to prevent duplicates,
         # >reorder< and >add< factuals to top; necessary in order to use the index
         df = self._mlmodel.data.df.copy()
         cond = df.isin(factuals).values
         df = df.drop(df[cond].index)
-        df = pd.concat([factuals, df], ignore_index=True)
+        # df = pd.concat([factuals, df], ignore_index=True)
 
         df = self._mlmodel.get_ordered_features(df)
         factuals = self._mlmodel.get_ordered_features(factuals)
 
         list_cfs = []
-        for i in range(factuals.shape[0]):
+        for i in tqdm(range(factuals.shape[0])):
             cf = graph_search(
                 df,
+                factuals,
+                W,
+                G,
+                self._mlmodel._preprocessor,
                 i,
                 self._immutables,
                 self._mlmodel,
+                n_neighbors=n_neighbors,
                 mode=self._mode,
                 frac=self._fraction,
+                radius=self._radius,
+                weight_function=self.weight_function,
+                epsilon_constraints=self.epsilon_constraints,
             )
-            list_cfs.append(cf)
-
+            list_cfs.append(cf if not any(np.isnan(cf)) else factuals.values[i])
         df_cfs = check_counterfactuals(self._mlmodel, list_cfs, factuals.index)
         df_cfs = self._mlmodel.get_ordered_features(df_cfs)
         return df_cfs

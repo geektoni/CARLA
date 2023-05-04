@@ -127,6 +127,7 @@ class VariationalAutoencoder(nn.Module):
         )
 
         criterion = nn.BCELoss(reduction="sum")
+        criterion = nn.MSELoss(reduction="sum")
 
         # Train the VAE with the new prior
         ELBO = np.zeros((epochs, 1))

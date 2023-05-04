@@ -3,6 +3,7 @@ from typing import Dict, Optional, Tuple
 import numpy as np
 import pandas as pd
 from lime.lime_tabular import LimeTabularExplainer
+from tqdm import tqdm
 
 from carla import log
 from carla.recourse_methods.catalog.roar.library import roar_recourse
@@ -150,7 +151,8 @@ class Roar(RecourseMethod):
         coeffs = np.zeros(factuals.shape)
         intercepts = []
         lime_data = self._data.df[self._mlmodel.feature_input_order]
-        lime_label = self._data.df[self._data.target]
+        # lime_label = self._data.df[self._data.target]
+        lime_label = self._mlmodel.predict(lime_data)
 
         lime_exp = LimeTabularExplainer(
             training_data=lime_data.values,
@@ -158,20 +160,19 @@ class Roar(RecourseMethod):
             feature_names=self._mlmodel.feature_input_order,
             discretize_continuous=self._discretize_continuous,
             sample_around_instance=self._sample_around_instance,
-            categorical_names=[
-                cat
-                for cat in self._mlmodel.feature_input_order
-                if cat not in self._data.continuous
-            ]
+            # categorical_names=[
+            #    cat
+            #    for cat in self._mlmodel.feature_input_order
+            #    if cat not in self._data.continuous
+            # ]
             # self._data.encoded_normalized's categorical features contain feature name and value, separated by '_'
             # while self._data.categorical do not contain those additional values.
         )
-
         for index, row in factuals.iterrows():
             factual = row.values
             explanations = lime_exp.explain_instance(
                 factual,
-                self._mlmodel.predict_proba,
+                self._mlmodel.predict_proba_double,
                 num_features=len(self._mlmodel.feature_input_order),
             )
             intercepts.append(explanations.intercept[1])
@@ -181,16 +182,20 @@ class Roar(RecourseMethod):
 
         return coeffs, np.array(intercepts)
 
-    def get_counterfactuals(self, factuals: pd.DataFrame) -> pd.DataFrame:
+    def get_counterfactuals(
+        self, factuals: pd.DataFrame, W: pd.DataFrame
+    ) -> pd.DataFrame:
         factuals = factuals.reset_index()
         factuals = self._mlmodel.get_ordered_features(factuals)
 
-        encoded_feature_names = self._mlmodel.data.encoder.get_feature_names(
-            self._mlmodel.data.categorical
-        )
-        cat_features_indices = [
-            factuals.columns.get_loc(feature) for feature in encoded_feature_names
-        ]
+        # encoded_feature_names = self._mlmodel.data.encoder.get_feature_names(
+        #    self._mlmodel.data.categorical
+        # )
+        # cat_features_indices = [
+        #    factuals.columns.get_loc(feature) for feature in encoded_feature_names
+        # ]
+
+        cat_features_indices = []
 
         coeffs = self._coeffs
         intercepts = self._intercepts
@@ -246,17 +251,28 @@ class Roar(RecourseMethod):
                 axis=1
             )
 
+        mutables_index = (~factuals.columns.isin(self._mlmodel.data.immutables)).astype(
+            int
+        )
+        immutables_index = (
+            factuals.columns.isin(self._mlmodel.data.immutables)
+        ).astype(int)
+
         cfs = []
-        for index, row in factuals.iterrows():
+        for index, row in tqdm(factuals.iterrows()):
 
             coeff = coeffs[index]
             intercept = intercepts[index]
 
             counterfactual = roar_recourse(
                 self._mlmodel.raw_model,
+                factuals.columns,
+                W.iloc[[index]],
                 row.to_numpy().reshape((1, -1)),
                 coeff,
                 intercept,
+                mutables_index,
+                immutables_index,
                 cat_features_indices,
                 binary_cat_features=self._binary_cat_features,
                 feature_costs=self._feature_costs,

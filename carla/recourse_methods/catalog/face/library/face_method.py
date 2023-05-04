@@ -2,6 +2,7 @@
 import copy
 
 import numpy as np
+import pandas as pd
 
 # import Dijkstra's shortest path algorithm
 from scipy.sparse import csgraph, csr_matrix
@@ -12,6 +13,10 @@ from sklearn.neighbors import kneighbors_graph, radius_neighbors_graph
 
 def graph_search(
     data,
+    factuals,
+    W,
+    G,
+    preprocessor,
     index,
     keys_immutable,
     model,
@@ -20,6 +25,9 @@ def graph_search(
     mode="knn",
     frac=0.4,
     radius=0.25,
+    weight_function=None,
+    epsilon_constraints=0.5,
+    augment=False,
 ):
     # This one implements the FACE method from
     # Rafael Poyiadzi et al (2020), "FACE: Feasible and Actionable Counterfactual Explanations",
@@ -36,24 +44,62 @@ def graph_search(
     :param radius: float > 0; parameter for epsilon density graph
     :return: candidate_counterfactual_star: np array (min. cost counterfactual explanation)
     """
+
+    # Augment the data by adding slightly changed points around the factuals
+    data_mean, data_cov = data.median(), np.cov(data.values, rowvar=False)
+    current_factual = factuals.iloc[index]
+    mask_mutables = (~data_mean.index.isin(keys_immutable)).astype(int)
+    mask_immutables = (data_mean.index.isin(keys_immutable)).astype(int)
+    # augmented_data = [np.abs(np.multiply(mask_mutables, np.random.multivariate_normal(data_mean, data_cov*2.0))) for _ in range(50)]
+    augmented_data = [
+        np.abs(
+            np.multiply(mask_immutables, current_factual.values)
+            + np.multiply(
+                mask_mutables, np.random.multivariate_normal(data_mean, data_cov)
+            )
+        )
+        for _ in range(100)
+    ]
+    augmented_data += [
+        np.abs(
+            np.multiply(mask_immutables, current_factual.values)
+            + np.multiply(
+                mask_mutables, np.random.multivariate_normal(data_mean, data_cov * 2)
+            )
+        )
+        for _ in range(100)
+    ]
+    augmented_data = pd.DataFrame(augmented_data, columns=factuals.columns)
+
     # Choose a subset of data for computational efficiency
-    data = choose_random_subset(data, frac, index)
+    # data = choose_random_subset(data, frac, index)
+    data = data.sample(int(len(data) * frac))
+    data = pd.concat([factuals, augmented_data, data], ignore_index=True)
 
     # ADD CONSTRAINTS by immutable inputs into adjacency matrix
     # if element in adjacency matrix 0, then it cannot be reached
     # this ensures that paths only take same sex / same race / ... etc. routes
+    immutable_constraint_matrix1 = np.ones((len(data), len(data)))
+    immutable_constraint_matrix2 = np.ones((len(data), len(data)))
     for i in range(len(keys_immutable)):
-        immutable_constraint_matrix1, immutable_constraint_matrix2 = build_constraints(
-            data, i, keys_immutable
+        (
+            immutable_constraint_matrix1_tmp,
+            immutable_constraint_matrix2_tmp,
+        ) = build_constraints(data, i, keys_immutable, epsilon=epsilon_constraints)
+        immutable_constraint_matrix1 = np.multiply(
+            immutable_constraint_matrix1, immutable_constraint_matrix1_tmp
+        )
+        immutable_constraint_matrix2 = np.multiply(
+            immutable_constraint_matrix2, immutable_constraint_matrix2_tmp
         )
 
     # POSITIVE PREDICTIONS
-    y_predicted = model.predict_proba(data.values)
-    y_predicted = np.argmax(y_predicted, axis=1)
+    y_predicted = model.predict_proba(data)
+    y_predicted = np.round(y_predicted)
     y_positive_indeces = np.where(y_predicted == 1)
 
     if mode == "knn":
-        boundary = 3  # chosen in ad-hoc fashion
+        boundary = int(n_neighbors * 0.5)  # chosen in ad-hoc fashion
         median = n_neighbors
         is_knn = True
 
@@ -107,6 +153,20 @@ def graph_search(
     else:
         raise ValueError("Distance not defined yet. Choose p_norm to be 1 or 2")
 
+    # Add the weight function
+    if weight_function != None:
+        c_dist = 0
+        candidate_counterfactuals = pd.DataFrame(
+            candidate_counterfactuals, columns=data.columns
+        )
+        for idx_c in range(len(candidate_counterfactuals)):
+            c_dist += weight_function(
+                data.iloc[[index]],
+                candidate_counterfactuals.iloc[[idx_c]],
+                W.iloc[[index]],
+                G.iloc[[index]] if G else None,
+                preprocessor,
+            )
     min_index = np.argmin(c_dist)
     candidate_counterfactual_star = candidate_counterfactual_star[min_index]
 
@@ -162,10 +222,13 @@ def build_constraints(data, i, keys_immutable, epsilon=0.5):
     -------
     np.ndarray, np.ndarray
     """
-    immutable_constraint_matrix = np.outer(
-        data[keys_immutable[i]].values + epsilon,
-        data[keys_immutable[i]].values + epsilon,
+    immutable_constraint_matrix = np.subtract.outer(
+        data[keys_immutable[i]].values,
+        data[keys_immutable[i]].values,
     )
+    return ((np.abs(immutable_constraint_matrix) <= epsilon) * 1).astype(float), (
+        (np.abs(immutable_constraint_matrix) <= epsilon) * 1
+    ).astype(float)
     immutable_constraint_matrix1 = immutable_constraint_matrix / ((1 + epsilon) ** 2)
     immutable_constraint_matrix1 = ((immutable_constraint_matrix1 == 1) * 1).astype(
         float
@@ -210,8 +273,15 @@ def find_counterfactuals(
     graph = build_graph(
         data, immutable_constraint_matrix1, immutable_constraint_matrix2, is_knn, n
     )
+
     # STEP 2 -- APPLY SHORTEST PATH ALGORITHM  ## indeces=index (corresponds to x^F)
     distances, min_distance = shortest_path(graph, index)
+
+    # If the min_distance is inf, then there is not reachable counterfactual.
+    # Therefore, we return empty
+    if np.isposinf(min_distance):
+        return []
+
     # STEP 3 -- FIND COUNTERFACTUALS
     # minimum distance candidate counterfactuals
     candidate_min_distances = [
@@ -281,7 +351,7 @@ def build_graph(
     adjacency_matrix = np.multiply(
         adjacency_matrix,
         immutable_constraint_matrix1,
-        immutable_constraint_matrix2,
     )  # element wise multiplication
+
     graph = csr_matrix(adjacency_matrix)
     return graph

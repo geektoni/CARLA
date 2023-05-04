@@ -72,7 +72,7 @@ class Wachter(RecourseMethod):
 
     def __init__(self, mlmodel, hyperparams: Optional[Dict] = None):
 
-        supported_backends = ["pytorch"]
+        supported_backends = ["pytorch", "sklearn"]
         if mlmodel.backend not in supported_backends:
             raise ValueError(
                 f"{mlmodel.backend} is not in supported backends {supported_backends}"
@@ -97,16 +97,21 @@ class Wachter(RecourseMethod):
     def get_counterfactuals(self, factuals: pd.DataFrame) -> pd.DataFrame:
         factuals = self._mlmodel.get_ordered_features(factuals)
 
-        encoded_feature_names = self._mlmodel.data.encoder.get_feature_names(
-            self._mlmodel.data.categorical
-        )
-        cat_features_indices = [
-            factuals.columns.get_loc(feature) for feature in encoded_feature_names
-        ]
+        if self._mlmodel.data.categorical:
+            encoded_feature_names = self._mlmodel.data.encoder.get_feature_names(
+                self._mlmodel.data.categorical
+            )
+            cat_features_indices = [
+                factuals.columns.get_loc(feature) for feature in encoded_feature_names
+            ]
+        else:
+            encoded_feature_names = []
+            cat_features_indices = []
 
         df_cfs = factuals.apply(
             lambda x: wachter_recourse(
                 self._mlmodel.raw_model,
+                self._mlmodel.backend,
                 x.reshape((1, -1)),
                 cat_features_indices,
                 y_target=self._y_target,

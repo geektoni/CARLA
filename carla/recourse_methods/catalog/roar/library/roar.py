@@ -2,6 +2,7 @@ import datetime
 from typing import List, Optional, Tuple
 
 import numpy as np
+import pandas as pd
 import torch
 import torch.optim as optim
 from scipy.optimize import linprog
@@ -63,9 +64,13 @@ def _calc_max_perturbation(
 
 def roar_recourse(
     torch_model,
+    columns: list,
+    weights: dict,
     x: np.ndarray,
     coeff: np.ndarray,
     intercept: np.float,
+    mutables_index: List[int],
+    immutables_index: List[int],
     cat_feature_indices: List[int],
     binary_cat_features: bool = True,
     feature_costs: Optional[List[float]] = None,
@@ -124,8 +129,8 @@ def roar_recourse(
     device = "cuda" if torch.cuda.is_available() else "cpu"
     torch.manual_seed(seed)
 
-    if feature_costs is not None:
-        feature_costs = torch.from_numpy(feature_costs).float().to(device)
+    # if feature_costs is not None:
+    #    feature_costs = torch.from_numpy(feature_costs).float().to(device)
 
     coeff = torch.from_numpy(coeff).float().to(device)
     intercept = torch.from_numpy(np.asarray([intercept])).float().to(device)
@@ -168,10 +173,15 @@ def roar_recourse(
     while loss_diff > loss_threshold:
         loss_prev = loss.clone().detach()
 
+        # x_new_enc = reconstruct_encoding_constraints(
+        #    x_new, cat_feature_indices, binary_cat_features
+        # )
+
         # x_new_enc is a copy of x_new with reconstructed encoding constraints of x_new
         # such that categorical data is either 0 or 1
-        x_new_enc = reconstruct_encoding_constraints(
-            x_new, cat_feature_indices, binary_cat_features
+        x_new_enc = (
+            torch.FloatTensor(mutables_index) * x_new
+            + torch.FloatTensor(immutables_index) * x.clone()
         )
 
         # Calculate max delta perturbation on weights
@@ -194,11 +204,17 @@ def roar_recourse(
             # single logit score for the target class for MSE loss
             f_x_new = torch.log(f_x_new / (1 - f_x_new))
 
-        cost = (
-            torch.dist(x_new_enc, x, norm)
-            if feature_costs is None
-            else torch.norm(feature_costs * (x_new_enc - x), norm)
-        )
+        if feature_costs:
+            x_cf = pd.DataFrame(x_new_enc.detach().numpy(), columns=columns)
+            x_or = pd.DataFrame(x.detach().numpy(), columns=columns)
+
+            cost = feature_costs(x_cf, x_or, weights)
+        else:
+            cost = (
+                torch.dist(x_new_enc, x, norm)
+                if feature_costs is None
+                else torch.norm(feature_costs * (x_new_enc - x), norm)
+            )
 
         loss = loss_fn(f_x_new, target_class) + lamb * cost
         loss.backward()
@@ -206,6 +222,13 @@ def roar_recourse(
         optimizer.step()
 
         loss_diff = torch.dist(loss_prev, loss, 2)
+
+        # x_new_enc is a copy of x_new with reconstructed encoding constraints of x_new
+        # such that categorical data is either 0 or 1
+        x_new_enc = (
+            torch.FloatTensor(mutables_index) * x_new
+            + torch.FloatTensor(immutables_index) * x.clone()
+        )
 
         if datetime.datetime.now() - t0 > t_max:
             log.info("Timeout - ROAR didn't converge")
